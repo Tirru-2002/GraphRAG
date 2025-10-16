@@ -1,7 +1,7 @@
 
 """
 Streamlit app. This file depends on graph_rag.py in the same folder.
-Run with: streamlit run app.py
+Run with: streamlit run frontend.py
 """
 import streamlit as st
 import base64
