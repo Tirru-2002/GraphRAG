@@ -1,4 +1,4 @@
-# AI Code Companion with GraphRAG
+# AI Companion with GraphRAG
 
 A Streamlit-based AI coding assistant powered by Ollama, LangChain, and Neo4j. It supports document uploads (PDF, DOCX, CSV, TXT) for building knowledge graphs, debugging, code analysis, and more.
 
