@@ -1,0 +1,2 @@
+GEMINI_API_KEY = "AIzaSyAiO_3PF3kEsFrF_6D3Q7MbKBMlDCOMvrE"  # Replace with your actual API key
+OPENAI_API_KEY = "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"

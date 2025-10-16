@@ -1,0 +1,10 @@
+# Environments
+.env
+.env.local
+.env.*.local
+__pycache__/
+.venv/
+venv/
+
+
+
