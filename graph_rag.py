@@ -1,7 +1,7 @@
 # ===== file: graph_rag.py =====
 """
 Graph backend code: DocumentProcessor, Neo4jGraphDB, GraphRAGChatbot
-Place this file next to app.py and import GraphRAGChatbot from it.
+Place this file next to frontend.py and import GraphRAGChatbot from it.
 """
 import os
 import logging
