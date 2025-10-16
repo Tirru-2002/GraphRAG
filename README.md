@@ -1,6 +1,6 @@
 # AI Companion with GraphRAG
 
-A Streamlit-based AI coding assistant powered by Ollama, LangChain, and Neo4j. It supports document uploads (PDF, DOCX, CSV, TXT) for building knowledge graphs, debugging, code analysis, and more.
+A Streamlit-based AI assistant powered by Ollama, LangChain, and Neo4j. It supports document uploads (PDF, DOCX, CSV, TXT) for building knowledge graphs, debugging, code analysis, and more.
 
 ---
 
@@ -24,7 +24,7 @@ A Streamlit-based AI coding assistant powered by Ollama, LangChain, and Neo4j. I
 
 ## Project Overview
 
-This project is an **AI Code Companion** built with Streamlit. It uses a local LLM (Ollama) together with LangChain and Neo4j to provide a developer assistant that can:
+This project is an **AI Companion** built with Streamlit. It uses a local LLM (Ollama) together with LangChain and Neo4j to provide a developer assistant that can:
 
 - Ingest documents (PDF, DOCX, CSV, TXT).
 - Build a knowledge graph (Neo4j) from uploaded documents.
@@ -254,4 +254,9 @@ Contributions are welcome. To contribute:
 
 
 If you want me to export this as a `README.md` file or adjust wording, tell me what to change.
+
+
+
+
+### Use Custom System prompts to get better results.
 
