@@ -90,8 +90,8 @@ Follow these steps to set up a clean Python environment and run the app.
    ollama serve
    ```
 
-   - (Optional) Pull models to the local Ollama server, for example:
-
+   - Pull models to the local Ollama server, for example:
+   #### Make sure models are capable to call tools, funtionCall.
    ```bash
    ollama pull llama3.2:latest
    ```
