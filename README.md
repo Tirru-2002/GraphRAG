@@ -2,6 +2,16 @@
 
 A Streamlit-based AI assistant powered by Ollama, LangChain, and Neo4j. It supports document uploads (PDF, DOCX, CSV, TXT) for building knowledge graphs, debugging, code analysis, and more.
 
+## Why I Started This Project
+
+For years, building a graph database from raw text was slow and hard. Experts had to read documents line by line, find hidden connections, and decide how each piece of data linked to another. This work could take weeks, and small mistakes broke the whole structure.
+
+I kept asking: why should something so valuable be so painful to build?
+
+Then Large Language Models became powerful enough to read text like a human, but much faster. They could understand context and find relationships automatically. This inspired me to build this project.
+
+I wanted a system where anyone could upload a PDF, DOCX, or CSV, and the AI would read it, find connections, and build a real knowledge graph in Neo4j. Using Ollama, LangChain, and Streamlit, I turned a once-manual, error-prone task into a simple, automatic process powered by intelligent understanding.
+
 ---
 
 ## Table of Contents
