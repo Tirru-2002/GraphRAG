@@ -1,6 +1,6 @@
 """
 Graph backend code with spaCy NER instead of LLM
-Place this file next to app.py and import GraphRAGChatbot from it.   
+Place this file next to app.py and import GraphRAGChatbot from it.
 """
 import os
 import logging
@@ -16,6 +16,19 @@ from neo4j import GraphDatabase
 import spacy
 from spacy.tokens import Doc
 
+# --- Docling (optional) ---------------------------------------------------
+# Docling parses PDF / DOCX / PPTX / HTML / images locally.
+# No API key needed and no internet needed after the model weights are
+# cached the first time. If it is not installed, the app still works,
+# it just falls back to the old pypdf / python-docx extractors below.
+try:
+    from docling.document_converter import DocumentConverter
+    from docling.chunking import HybridChunker
+    DOCLING_AVAILABLE = True
+except ImportError:
+    DOCLING_AVAILABLE = False
+# ---------------------------------------------------------------------------
+
 # allow nested event loops when using asyncio.run inside Streamlit
 nest_asyncio.apply()
 
@@ -27,6 +40,80 @@ logger = logging.getLogger(__name__)
 
 class DocumentProcessor:
     """Process multiple document formats into plain text."""
+
+    # Docling loads its layout/OCR models once. We cache the converter
+    # here so every call does not reload the models from scratch.
+    _docling_converter = None
+
+    # ---------------- Docling functions ----------------
+
+    @staticmethod
+    def _get_docling_converter():
+        """Create the Docling converter once, then reuse it (lazy singleton)."""
+        if DocumentProcessor._docling_converter is None:
+            DocumentProcessor._docling_converter = DocumentConverter()
+        return DocumentProcessor._docling_converter
+
+    @staticmethod
+    def extract_with_docling(file_path: str) -> str:
+        """
+        Extract a document's content as Markdown using Docling.
+
+        Docling supports PDF, DOCX, PPTX, HTML, images (PNG/JPEG) and more.
+        It keeps headings, lists and table structure, which plain
+        pypdf/python-docx text extraction loses. This runs 100% locally
+        on CPU - no CUDA and no API key required.
+        """
+        if not DOCLING_AVAILABLE:
+            raise ImportError(
+                "Docling is not installed. Run: pip install docling"
+            )
+
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        try:
+            converter = DocumentProcessor._get_docling_converter()
+            result = converter.convert(str(file_path))
+            return result.document.export_to_markdown()
+        except Exception as e:
+            logger.error(f"Error processing file with Docling: {e}")
+            raise
+
+    @staticmethod
+    def extract_with_docling_chunks(file_path: str) -> List[str]:
+        """
+        Extract a document with Docling AND split it into RAG-ready chunks
+        using Docling's HybridChunker.
+
+        This is the recommended function to call before feeding text into
+        SpacyGraphExtractor / Neo4j below - each returned chunk is already
+        a clean, self-contained piece of text, sized for embedding/graph
+        extraction, instead of one giant blob of text.
+        """
+        if not DOCLING_AVAILABLE:
+            raise ImportError(
+                "Docling is not installed. Run: pip install docling"
+            )
+
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        try:
+            converter = DocumentProcessor._get_docling_converter()
+            result = converter.convert(str(file_path))
+
+            chunker = HybridChunker()
+            chunks = list(chunker.chunk(result.document))
+
+            return [chunk.text for chunk in chunks]
+        except Exception as e:
+            logger.error(f"Error chunking file with Docling: {e}")
+            raise
+
+    # ---------------- Original fallback extractors (unchanged) ----------------
 
     @staticmethod
     def extract_pdf(file_path: str) -> str:
@@ -85,13 +172,35 @@ class DocumentProcessor:
             logger.error(f"Error processing TXT: {e}")
             raise
 
+    # ---------------- Main entry point ----------------
+
     @staticmethod
-    def process_document(file_path: str) -> str:
+    def process_document(file_path: str, use_docling: bool = True) -> str:
+        """
+        Convert a document into plain/markdown text.
+
+        use_docling=True (default):
+            Use Docling for PDF / DOCX / PPTX / HTML / images, since it
+            gives cleaner text and keeps table structure. If Docling is
+            not installed, or the conversion fails for any reason, this
+            automatically falls back to the old pypdf / python-docx code.
+        use_docling=False:
+            Always use the old pypdf / python-docx extractors only.
+        """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
         extension = file_path.suffix.lower()
+        docling_supported = {'.pdf', '.docx', '.pptx', '.html', '.htm',
+                              '.png', '.jpg', '.jpeg'}
+
+        if use_docling and DOCLING_AVAILABLE and extension in docling_supported:
+            try:
+                return DocumentProcessor.extract_with_docling(str(file_path))
+            except Exception as e:
+                logger.warning(f"Docling extraction failed, falling back to old extractor: {e}")
+
         processors = {
             '.pdf': DocumentProcessor.extract_pdf,
             '.docx': DocumentProcessor.extract_docx,
@@ -107,7 +216,7 @@ class DocumentProcessor:
 
 class SpacyGraphExtractor:
     """Extract knowledge graph using spaCy NER and dependency parsing."""
-    
+
     def __init__(self, model_name: str = "en_core_web_sm"):
         """Initialize spaCy model."""
         try:
@@ -117,19 +226,19 @@ class SpacyGraphExtractor:
             logger.warning(f"Model {model_name} not found. Downloading...")
             os.system(f"python -m spacy download {model_name}")
             self.nlp = spacy.load(model_name)
-    
+
     def extract_entities(self, text: str) -> List[Dict]:
         """Extract named entities from text."""
         doc = self.nlp(text)
         entities = []
-        
+
         for ent in doc.ents:
             entities.append({
                 'id': ent.text,
                 'type': ent.label_,
                 'text': ent.text
             })
-        
+
         # Remove duplicates based on text
         unique_entities = []
         seen = set()
@@ -137,33 +246,33 @@ class SpacyGraphExtractor:
             if entity['text'] not in seen:
                 seen.add(entity['text'])
                 unique_entities.append(entity)
-        
+
         return unique_entities
-    
+
     def extract_relationships(self, text: str) -> List[Dict]:
         """Extract relationships using dependency parsing."""
         doc = self.nlp(text)
         relationships = []
-        
+
         for token in doc:
             # Find verb-based relationships
             if token.pos_ == "VERB":
                 subject = None
                 obj = None
-                
+
                 # Find subject and object
                 for child in token.children:
-                    if child.dep_ in ["nsubj", "nsubjpass"]:
+                    if child.dep_ in ["nsubj", "nsubjpass"]:  # Nominal Subject
                         subject = child
-                    elif child.dep_ in ["dobj", "pobj", "attr"]:
+                    elif child.dep_ in ["dobj", "pobj", "attr"]:  # Direct Object
                         obj = child
-                
+
                 # Create relationship if both subject and object found
                 if subject and obj:
                     # Get entity types
                     subject_type = self._get_entity_type(subject, doc)
                     obj_type = self._get_entity_type(obj, doc)
-                    
+
                     relationships.append({
                         'source': {
                             'id': subject.text,
@@ -173,19 +282,19 @@ class SpacyGraphExtractor:
                             'id': obj.text,
                             'type': obj_type
                         },
-                        'type': self._classify_relationship(token.text),
+                        'type': self._classify_relationship(token.text),  # every text here is verb, because token.pos_ == "VERB"
                         'verb': token.text
                     })
-        
+
         return relationships
-    
+
     def _get_entity_type(self, token, doc) -> str:
         """Get entity type for a token."""
         # Check if token is part of a named entity
         for ent in doc.ents:
             if token.i >= ent.start and token.i < ent.end:
                 return ent.label_
-        
+
         # Default type based on POS tag
         if token.pos_ == "PROPN":
             return "ENTITY"
@@ -193,18 +302,18 @@ class SpacyGraphExtractor:
             return "CONCEPT"
         else:
             return "UNKNOWN"
-    
+
     def _classify_relationship(self, verb: str) -> str:
         """Classify relationship type based on verb."""
         verb_lower = verb.lower()
-        
+
         # Define relationship mappings
         work_verbs = ["works", "work", "worked", "working", "employed"]
         manage_verbs = ["manages", "manage", "managed", "managing", "leads", "lead"]
         create_verbs = ["creates", "create", "created", "builds", "built", "develops"]
         owns_verbs = ["owns", "own", "owned", "possesses", "has"]
         located_verbs = ["located", "lives", "resides", "based"]
-        
+
         if verb_lower in work_verbs:
             return "WORKS_FOR"
         elif verb_lower in manage_verbs:
@@ -217,12 +326,12 @@ class SpacyGraphExtractor:
             return "LOCATED_IN"
         else:
             return "RELATED_TO"
-    
+
     def extract_graph(self, text: str) -> Dict:
         """Extract complete graph from text."""
         entities = self.extract_entities(text)
         relationships = self.extract_relationships(text)
-        
+
         return {
             'nodes': entities,
             'relationships': relationships
@@ -273,13 +382,12 @@ class Neo4jGraphDB:
         def _norm_id(value: str) -> str:
             return str(value).strip().lower()
 
-
         def _sanitize_label(label: str) -> str:
             if not label or not isinstance(label, str):
                 label = "ENTITY"
             lbl = re.sub(r'[^0-9A-Za-z_]', '_', label.strip())
             if re.match(r'^\d', lbl):
-                lbl = "L_" + lbl
+                lbl = "Num_" + lbl
             return lbl or "ENTITY"
 
         def _sanitize_rel_type(rel: str) -> str:
@@ -376,27 +484,11 @@ class Neo4jGraphDB:
                             pair_map[(r['src_label'], r['tgt_label'])].append(r)
 
                         for (src_lbl, tgt_lbl), pair_rels in pair_map.items():
-                            prepared = [{"src_id": r["src_id"], "tgt_id": r["tgt_id"], "verb": r.get("verb","")} for r in pair_rels]
+                            prepared = [{"src_id": r["src_id"], "tgt_id": r["tgt_id"], "verb": r.get("verb", "")} for r in pair_rels]
                             if not prepared:
                                 continue
 
-                            # 1) Label-qualified MERGE: ensure nodes are matched with their labels
-                            try:
-                                label_query = f"""
-                                UNWIND $pairs AS rel
-                                MERGE (source:`{src_lbl}` {{id: rel.src_id}})
-                                MERGE (target:`{tgt_lbl}` {{id: rel.tgt_id}})
-                                MERGE (source)-[rr:`{rtype}`]->(target)
-                                SET rr.verb = rel.verb
-                                """
-                                session.run(label_query, pairs=prepared)
-                                total_relationships += len(prepared)
-                                logger.info(f"Created {len(prepared)} relationships of type {rtype} between {src_lbl} -> {tgt_lbl}")
-                                continue
-                            except Exception as e:
-                                logger.warning(f"Label-qualified creation failed for {rtype} {src_lbl}->{tgt_lbl}: {e}")
-
-                            # 2) Fallback: label-qualified MATCH + MERGE relationship (safer than unlabeled)
+                            # Label-qualified MATCH + MERGE relationship (safer than unlabeled) --> best practice
                             try:
                                 fallback_query = f"""
                                 UNWIND $pairs AS rel
@@ -412,7 +504,7 @@ class Neo4jGraphDB:
                             except Exception as e:
                                 logger.warning(f"Fallback label-MATCH creation failed for {rtype} {src_lbl}->{tgt_lbl}: {e}")
 
-                            # 3) Last resort (id-only) if the above fail
+                            # Last resort (id-only) if the above fail
                             try:
                                 id_only_query = f"""
                                 UNWIND $pairs AS rel
@@ -449,8 +541,6 @@ class Neo4jGraphDB:
             logger.error(f"Error uploading graph data: {e}")
             raise
 
-
-
     def query_graph(self, cypher_query: str) -> List[dict]:
         if not self.is_connected():
             return []
@@ -479,7 +569,7 @@ class Neo4jGraphDB:
 
 class GraphRAGChatbot:
     """GraphRAG backend class using spaCy for graph extraction."""
-    
+
     def __init__(self, spacy_model: str = "en_core_web_sm"):
         self.document_processor = DocumentProcessor()
 
@@ -505,14 +595,14 @@ class GraphRAGChatbot:
         try:
             # Extract graph using spaCy
             graph_data = self.graph_extractor.extract_graph(text)
-            
+
             if graph_data and (graph_data['nodes'] or graph_data['relationships']):
                 # Upload to Neo4j
                 self.graph_db.upload_graph_data_from_spacy(graph_data)
-                
+
                 # Get updated stats
                 stats = self.graph_db.get_graph_stats()
-                
+
                 return {
                     "nodes": len(graph_data['nodes']),
                     "relationships": len(graph_data['relationships']),
@@ -523,8 +613,56 @@ class GraphRAGChatbot:
 
         return None
 
+    def process_and_upload_file(self, file_path: str, use_docling: bool = True) -> Optional[dict]:
+        """
+        Full pipeline for one file: parse it with Docling (chunked),
+        run spaCy graph extraction on every chunk, and upload everything
+        to Neo4j.
+
+        This is the function to call from app.py whenever a user uploads
+        a document - it replaces calling process_document() and
+        extract_and_upload_graph() separately for large files, since it
+        processes the document chunk-by-chunk instead of as one giant
+        block of text.
+        """
+        file_path = Path(file_path)
+        extension = file_path.suffix.lower()
+        docling_supported = {'.pdf', '.docx', '.pptx', '.html', '.htm',
+                              '.png', '.jpg', '.jpeg'}
+
+        chunks: List[str]
+
+        if use_docling and DOCLING_AVAILABLE and extension in docling_supported:
+            try:
+                chunks = self.document_processor.extract_with_docling_chunks(str(file_path))
+            except Exception as e:
+                logger.warning(f"Docling chunking failed, falling back to single-block text: {e}")
+                text = self.document_processor.process_document(str(file_path), use_docling=False)
+                chunks = [text]
+        else:
+            text = self.document_processor.process_document(str(file_path), use_docling=False)
+            chunks = [text]
+
+        total_nodes = 0
+        total_relationships = 0
+        for chunk_text in chunks:
+            if not chunk_text or not chunk_text.strip():
+                continue
+            result = self.extract_and_upload_graph(chunk_text)
+            if result:
+                total_nodes += result["nodes"]
+                total_relationships += result["relationships"]
+
+        stats = self.graph_db.get_graph_stats()
+        return {
+            "chunks_processed": len(chunks),
+            "nodes": total_nodes,
+            "relationships": total_relationships,
+            "stats": stats
+        }
+
     def retrieve_context_from_graph(self, query: str) -> str:
-        """Return a short text context pulled from Neo4j."""
+        """Return a short text context pulled from Neo4j (case-insensitive search)."""
         if not self.graph_db.is_connected():
             return ""
 
@@ -532,11 +670,12 @@ class GraphRAGChatbot:
             # Extract entities from query using spaCy
             if self.graph_extractor:
                 doc = self.graph_extractor.nlp(query)
-                query_entities = [ent.text for ent in doc.ents]
-                
+                query_entities = [ent.text.lower() for ent in doc.ents]  # Convert to lowercase
+
                 if query_entities:
-                    # Search for specific entities mentioned in query
-                    entity_filter = " OR ".join([f"n.name CONTAINS '{ent}'" for ent in query_entities[:3]])
+                    # Search for specific entities mentioned in query (case-insensitive)
+                    # Use toLower() in Cypher to make comparison case-insensitive
+                    entity_filter = " OR ".join([f"toLower(n.name) CONTAINS '{ent}'" for ent in query_entities[:5]])
                     cypher_query = f"""
                     MATCH (n)-[r]-(m)
                     WHERE {entity_filter}
@@ -556,7 +695,7 @@ class GraphRAGChatbot:
                 RETURN DISTINCT n.name as source_name, TYPE(r) as rel_type, m.name as target_name
                 LIMIT 10
                 """
-            
+
             results = self.graph_db.query_graph(cypher_query)
 
             if results:
@@ -568,414 +707,3 @@ class GraphRAGChatbot:
         except Exception as e:
             logger.error(f"Error retrieving context: {e}")
             return ""
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # ===== file: graph_rag.py =====
-# """
-# Graph backend code: DocumentProcessor, Neo4jGraphDB, GraphRAGChatbot
-# Place this file next to frontend.py and import GraphRAGChatbot from it.
-# """
-# import os
-# import logging
-# import asyncio
-# from pathlib import Path
-# from typing import List, Optional
-
-# import nest_asyncio
-# from dotenv import load_dotenv
-# import pypdf
-# import docx
-# import csv
-# from neo4j import GraphDatabase
-
-# # LLM / LangChain imports (used only if available)
-# from langchain_core.documents import Document
-# try:
-#     from langchain_ollama import ChatOllama
-#     from langchain_experimental.graph_transformers import LLMGraphTransformer
-# except Exception:
-#     # If these packages are not available at import time, delayed import is handled in code that needs them.
-#     ChatOllama = None
-#     LLMGraphTransformer = None
-
-# # allow nested event loops when using asyncio.run inside Streamlit
-# nest_asyncio.apply()
-
-# # load .env if present
-# load_dotenv()
-
-# logger = logging.getLogger(__name__)
-
-
-# class DocumentProcessor:
-#     """Process multiple document formats into plain text."""
-
-#     @staticmethod
-#     def extract_pdf(file_path: str) -> str:
-#         try:
-#             text = ""
-#             with open(file_path, 'rb') as pdf_file:
-#                 pdf_reader = pypdf.PdfReader(pdf_file)
-#                 for page_num, page in enumerate(pdf_reader.pages):
-#                     try:
-#                         text += f"\n--- Page {page_num + 1} ---\n"
-#                         text += page.extract_text() or ""
-#                     except Exception as e:
-#                         logger.warning(f"Error extracting page {page_num + 1}: {e}")
-#             return text
-#         except Exception as e:
-#             logger.error(f"Error processing PDF: {e}")
-#             raise
-
-#     @staticmethod
-#     def extract_docx(file_path: str) -> str:
-#         try:
-#             doc = docx.Document(file_path)
-#             text = ""
-#             for para in doc.paragraphs:
-#                 text += para.text + "\n"
-#             for table in doc.tables:
-#                 for row in table.rows:
-#                     for cell in row.cells:
-#                         text += cell.text + " "
-#                     text += "\n"
-#             return text
-#         except Exception as e:
-#             logger.error(f"Error processing DOCX: {e}")
-#             raise
-
-#     @staticmethod
-#     def extract_csv(file_path: str) -> str:
-#         try:
-#             text = ""
-#             with open(file_path, 'r', encoding='utf-8') as csv_file:
-#                 reader = csv.DictReader(csv_file)
-#                 for row in reader:
-#                     text += str(row) + "\n"
-#             return text
-#         except Exception as e:
-#             logger.error(f"Error processing CSV: {e}")
-#             raise
-
-#     @staticmethod
-#     def extract_txt(file_path: str) -> str:
-#         try:
-#             with open(file_path, 'r', encoding='utf-8') as txt_file:
-#                 text = txt_file.read()
-#             return text
-#         except Exception as e:
-#             logger.error(f"Error processing TXT: {e}")
-#             raise
-
-#     @staticmethod
-#     def process_document(file_path: str) -> str:
-#         file_path = Path(file_path)
-#         if not file_path.exists():
-#             raise FileNotFoundError(f"File not found: {file_path}")
-
-#         extension = file_path.suffix.lower()
-#         processors = {
-#             '.pdf': DocumentProcessor.extract_pdf,
-#             '.docx': DocumentProcessor.extract_docx,
-#             '.csv': DocumentProcessor.extract_csv,
-#             '.txt': DocumentProcessor.extract_txt
-#         }
-
-#         if extension not in processors:
-#             raise ValueError(f"Unsupported file format: {extension}")
-
-#         return processors[extension](str(file_path))
-
-
-# class Neo4jGraphDB:
-#     """Manage Neo4j graph database operations."""
-
-#     def __init__(self, uri: str, user: str, password: str):
-#         try:
-#             self.driver = GraphDatabase.driver(uri, auth=(user, password))
-#             self.driver.verify_connectivity()
-#             logger.info("Connected to Neo4j successfully")
-#         except Exception as e:
-#             logger.error(f"Failed to connect to Neo4j: {e}")
-#             self.driver = None
-
-#     def is_connected(self) -> bool:
-#         return self.driver is not None
-
-#     def close(self):
-#         if self.driver:
-#             self.driver.close()
-
-#     def clear_database(self):
-#         if not self.is_connected():
-#             return
-#         try:
-#             with self.driver.session() as session:
-#                 session.run("MATCH (n) DETACH DELETE n")
-#             logger.info("Database cleared")
-#         except Exception as e:
-#             logger.error(f"Error clearing database: {e}")
-
-#     def upload_graph_data(self, graph_documents):
-#         if not self.is_connected():
-#             logger.warning("Not connected to Neo4j")
-#             return
-
-#         try:
-#             with self.driver.session() as session:
-#                 # Upload nodes
-#                 for node in graph_documents[0].nodes:
-#                     query = f"""
-#                     MERGE (n:`{node.type}` {{id: $id, name: $name}})
-#                     """
-#                     session.run(query, id=node.id, name=node.id)
-
-#                 # Upload relationships
-#                 for rel in graph_documents[0].relationships:
-#                     query = f"""
-#                     MATCH (source:`{rel.source.type}` {{id: $source_id}})
-#                     MATCH (target:`{rel.target.type}` {{id: $target_id}})
-#                     MERGE (source)-[r:`{rel.type}`]->(target)
-#                     """
-#                     try:
-#                         session.run(query, source_id=rel.source.id, target_id=rel.target.id)
-#                     except Exception as e:
-#                         logger.warning(f"Error creating relationship: {e}")
-
-#                 logger.info(f"Uploaded {len(graph_documents[0].nodes)} nodes and {len(graph_documents[0].relationships)} relationships")
-#         except Exception as e:
-#             logger.error(f"Error uploading graph data: {e}")
-
-#     def query_graph(self, cypher_query: str) -> List[dict]:
-#         if not self.is_connected():
-#             return []
-
-#         try:
-#             with self.driver.session() as session:
-#                 result = session.run(cypher_query)
-#                 return [record.data() for record in result]
-#         except Exception as e:
-#             logger.error(f"Error executing query: {e}")
-#             return []
-
-#     def get_graph_stats(self) -> dict:
-#         if not self.is_connected():
-#             return {}
-
-#         try:
-#             with self.driver.session() as session:
-#                 node_count = session.run("MATCH (n) RETURN COUNT(n) as count").single()["count"]
-#                 rel_count = session.run("MATCH ()-[r]-() RETURN COUNT(r) as count").single()["count"]
-#                 return {"nodes": node_count, "relationships": rel_count}
-#         except Exception as e:
-#             logger.error(f"Error getting graph stats: {e}")
-#             return {"nodes": 0, "relationships": 0}
-
-
-# class GraphRAGChatbot:
-#     """GraphRAG backend class. Keeps LLM + Neo4j logic separate from Streamlit UI."""
-
-#     def __init__(self, model: str = "llama3.2:latest", base_url: str = "http://localhost:11434", temperature: float = 0.6):
-#         self.document_processor = DocumentProcessor()
-
-#         neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-#         neo4j_user = os.getenv("NEO4J_USER", "neo4j")
-#         neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
-#         self.graph_db = Neo4jGraphDB(neo4j_uri, neo4j_user, neo4j_password)
-
-#         self.llm_gpt = None
-#         self.graph_transformer = None
-
-#         # try to initialize LLM; failure is non-fatal for the backend object
-#         try:
-#             self.init_llm(model=model, base_url=base_url, temperature=temperature)
-#         except Exception as e:
-#             logger.warning(f"Ollama initialization failed in GraphRAGChatbot.__init__: {e}")
-#             self.llm_gpt = None
-#             self.graph_transformer = None
-
-#     def init_llm(self, model: str = "llama3.2:latest", base_url: str = "http://localhost:11434", temperature: float = 0.6, stream: bool = True):
-#         """
-#         Initialize or update the local Ollama model and attach an LLMGraphTransformer.
-#         Call this at runtime to change model or temperature.
-#         """
-#         # clean previous
-#         self.llm_gpt = None
-#         self.graph_transformer = None
-
-#         if not model:
-#             logger.info("No Ollama model specified; skipping LLM init.")
-#             return
-
-#         if ChatOllama is None or LLMGraphTransformer is None:
-#             raise RuntimeError("langchain_ollama or LLMGraphTransformer not available. Please install required packages.")
-
-#         try:
-#             logger.info(f"Initializing Ollama model '{model}' at {base_url} (temp={temperature})")
-#             self.llm_gpt = ChatOllama(
-#                 model=model,
-#                 base_url=base_url,
-#                 temperature=temperature,
-#                 stream=stream
-#             )
-#             self.graph_transformer = LLMGraphTransformer(llm=self.llm_gpt)
-#             logger.info("Ollama LLM and graph transformer initialized.")
-#         except Exception as e:
-#             logger.error(f"Failed to initialize Ollama LLM: {e}")
-#             self.llm_gpt = None
-#             self.graph_transformer = None
-#             raise
-
-#     async def extract_and_upload_graph(self, text: str) -> Optional[dict]:
-#         """Extract graph from text and upload to Neo4j. Returns stats or None."""
-#         if not self.graph_transformer:
-#             logger.warning("Graph transformer not available")
-#             return None
-
-#         try:
-#             documents = [Document(page_content=text)]
-#             graph_documents = await self.graph_transformer.aconvert_to_graph_documents(documents)
-
-#             if graph_documents and len(graph_documents) > 0:
-#                 self.graph_db.upload_graph_data(graph_documents)
-#                 stats = self.graph_db.get_graph_stats()
-#                 return {
-#                     "nodes": len(graph_documents[0].nodes),
-#                     "relationships": len(graph_documents[0].relationships),
-#                     "stats": stats
-#                 }
-#         except Exception as e:
-#             logger.error(f"Error extracting graph: {e}")
-
-#         return None
-
-#     def retrieve_context_from_graph(self, query: str) -> str:
-#         """Return a short text context pulled from Neo4j for the UI to include in prompts."""
-#         if not self.graph_db.is_connected():
-#             return ""
-
-#         try:
-#             cypher_query = f"""
-#             MATCH (n)-[r]-(m)
-#             RETURN DISTINCT n.name as source_name, TYPE(r) as rel_type, m.name as target_name
-#             LIMIT 10
-#             """
-#             results = self.graph_db.query_graph(cypher_query)
-
-#             if results:
-#                 context = "Knowledge Graph Context:\n"
-#                 for result in results:
-#                     context += f"- {result.get('source_name', 'Unknown')} {result.get('rel_type', 'RELATED_TO')} {result.get('target_name', 'Unknown')}\n"
-#                 return context
-#             return ""
-#         except Exception as e:
-#             logger.error(f"Error retrieving context: {e}")
-#             return ""
